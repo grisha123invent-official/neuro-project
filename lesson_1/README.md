@@ -386,12 +386,15 @@ non_blocking_cond_wait(cardio_event, 'first cardio', 12)
 #### Определение глобальных переменных и обработчика PSD
 ```python
 from CapsuleSDK.PSDData import PSDData, PSDData_Band
+import numpy as np
 
 psd_freqs = None
 psd_vals = None
 alpha_low = None
 alpha_high = None
 last_psd_vals = None
+
+psd_event = EventFiredState()
 
 def on_psd(d, psd: PSDData):
     global psd_freqs, psd_vals, psd_event, alpha_low, alpha_high, last_psd_vals
