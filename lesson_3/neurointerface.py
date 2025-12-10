@@ -169,6 +169,11 @@ ax_psd.legend(loc='upper right')
 def update_plot(_):
     global channel_names, calibration_start_time, is_calibrated, current_direction
 
+    try:
+        device_locator.update()
+    except Exception as e:
+        print(f"[SDK] Update error: {e}")
+
     buf = ring.get()
     current_time = time.time()
 
@@ -207,7 +212,7 @@ def update_plot(_):
         print(f"[PSD] Error: {e}")
         return lines_eeg + lines_psd
 
-    #  Управление машинкой 
+    # Управление машинкой
     elapsed = current_time - calibration_start_time
     if not is_calibrated and elapsed >= CALIBRATION_DURATION:
         is_calibrated = True
@@ -225,6 +230,7 @@ def update_plot(_):
                 current_direction = "B"
 
     return lines_eeg + lines_psd
+
 
 def main():
     global device_locator, device
@@ -244,7 +250,7 @@ def main():
     device.set_on_connection_status_changed(on_connection_status_changed)
     device.set_on_eeg(on_eeg)
     device.connect(bipolarChannels=True)
-    if not non_blocking_cond_wait(device_conn_event, 'device connection', 20):
+    if not non_blocking_cond_wait(device_conn_event, 'device connection', 40):
         print("Failed to connect.")
         return
 
@@ -254,29 +260,28 @@ def main():
     # Начальная остановка машинки
     send_to_esp32("S")
 
+    # интерактивный режим
+    plt.ion() 
+
+    # Создаём анимацию без фонового потока
     ani = FuncAnimation(fig, update_plot, interval=100, blit=False, cache_frame_data=False)
 
-    running = True
-    def updater():
-        while running:
-            try:
-                device_locator.update()
-            except Exception:
-                pass
-            time.sleep(0.01)
-
-    t = threading.Thread(target=updater, daemon=True)
-    t.start()
-    plt.tight_layout()
+    # Отображаем окно и не блокируем основной поток
     plt.show()
 
-    running = False
-    # Финальная остановка
-    send_to_esp32("S")
-    udp_sock.close()
-    device.stop()
-    device.disconnect()
-    print("Stopped.")
+    # Основной цикл: ждём, пока окно не закроется
+    try:
+        while plt.fignum_exists(fig.number):  # пока окно открыто
+            plt.pause(0.1)  # короткая пауза, чтобы не грузить CPU
+    except KeyboardInterrupt:
+        pass
+    finally:
+        send_to_esp32("S")
+        udp_sock.close()
+        device.stop()
+        device.disconnect()
+        print("Stopped.")
+
 
 if __name__ == '__main__':
     main()
