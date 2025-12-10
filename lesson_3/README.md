@@ -136,6 +136,11 @@ motor_R = MX1508(19, 18)  # правый мотор (IN1=19, IN2=18)
 
 Speed = 500  # задаём скорость (0–1023)
 
+# Останавливаемся на 1 секунду
+motor_L.stop()
+motor_R.stop()
+sleep(1)
+
 # Едем вперёд 2 секунды
 motor_L.forward(Speed)
 motor_R.forward(Speed)
