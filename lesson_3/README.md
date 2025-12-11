@@ -28,7 +28,7 @@
 ### Требования перед стартом
 
 - Установленное приложение Thonny (рекомендуется версия 3.13.3) — IDE для работы с MicroPython.
-    - [`Ссылка для скачивания`]((https://github.com/thonny/thonny/releases/tag/v3.3.13))
+    - [`Ссылка для скачивания`]((https://github.com/thonny/thonny/releases/tag/v3.3.13)
 - ESP32, подключённый к компьютеру по USB.
 - Доступ к Wi-Fi сети.
 
