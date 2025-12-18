@@ -1,5 +1,6 @@
 import time
 import threading
+import os
 import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
@@ -12,24 +13,201 @@ from CapsuleSDK.DeviceLocator import DeviceLocator
 from CapsuleSDK.DeviceType import DeviceType
 from CapsuleSDK.Device import Device
 from CapsuleSDK.EEGTimedData import EEGTimedData
+from CapsuleSDK.Resistances import Resistances
 
 from eeg_utils import *
 
 # Конфиг
 PLATFORM = 'mac'
 EEG_WINDOW_SECONDS = 4.0
-CHANNELS = 2
+CHANNELS = 4
 BUFFER_LEN = int(SAMPLE_RATE * EEG_WINDOW_SECONDS)
 TARGET_SERIAL = None
 
-#  Настройки машинки и порога 
-ESP32_IP = "192.168.0.61"  #  замените на IP вашей ESP32
-UDP_PORT = 9999            #  должен совпадать с main.py на ESP32
-THRESHOLD = 4e-11     # порог мощности (подстройте под данные)
+# Настройки машинки и порога 
+ESP32_IP = "192.168.0.61"  # замените на IP вашей ESP32
+UDP_PORT = 9999            # должен совпадать с main.py на ESP32
+THRESHOLD = 5e-12          # порог мощности (подстройте под данные)
 CALIBRATION_DURATION = 10.0  # секунд "тишины" при старте
+
+# Ритмы
+ALPHA_LOW, ALPHA_HIGH = 8.0, 12.0
+BETA_LOW, BETA_HIGH = 13.0, 30.0
+USE_BETA = False # Переключите в True для задания 7.2
 
 # UDP-сокет для управления
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def send_cmd(cmd):
+    try:
+        udp_sock.sendto((cmd + "\n").encode(), (ESP32_IP, UDP_PORT))
+    except: pass
+
+device = None
+device_locator = None
+
+class EventFiredState:
+    def __init__(self): self._awake = False
+    def is_awake(self): return self._awake
+    def set_awake(self): self._awake = True
+    def sleep(self): self._awake = False
+
+device_list_event = EventFiredState()
+device_conn_event = EventFiredState()
+device_eeg_event = EventFiredState()
+
+ring = RingBuffer(n_channels=CHANNELS, maxlen=BUFFER_LEN)
+channel_names = []
+resistances_values = [0.0] * CHANNELS
+
+def non_blocking_cond_wait(wake_event: EventFiredState, name: str, total_sleep_time: int):
+    print(f"Waiting {name} up to {total_sleep_time}s...")
+    steps = int(total_sleep_time * 50)
+    for _ in range(steps):
+        if device_locator is not None:
+            try: device_locator.update()
+            except: pass
+        if wake_event.is_awake(): return True
+        time.sleep(0.02)
+    return False
+
+def on_device_list(locator, info, fail_reason):
+    global device
+    chosen = None
+    if len(info) == 0: return
+    if TARGET_SERIAL is None: chosen = info[0]
+    else:
+        for dev in info:
+            if dev.get_serial() == TARGET_SERIAL:
+                chosen = dev
+                break
+    if chosen:
+        print(f"Connecting to: {chosen.get_serial()}")
+        device = Device(locator, chosen.get_serial(), locator.get_lib())
+        device_list_event.set_awake()
+
+def on_connection_status_changed(d, status): 
+    global channel_names
+    ch_obj = device.get_channel_names()
+    channel_names = [ch_obj.get_name_by_index(i) for i in range(len(ch_obj))]
+    device_conn_event.set_awake()
+
+def on_resistances(resistances_obj: Resistances):
+    global resistances_values
+    resistances_values = [resistances_obj.get_value(i) / 1000 for i in range(len(resistances_obj))]
+
+def on_eeg(d, eeg: EEGTimedData):
+    global ring
+    samples = eeg.get_samples_count()
+    ch = eeg.get_channels_count()
+    if samples <= 0: return
+    block = np.zeros((ch, samples), dtype=float)
+    for i in range(samples):
+        for c in range(ch):
+            block[c, i] = eeg.get_processed_value(c, i)
+    ring.append_block(block[:CHANNELS, :])
+    if not device_eeg_event.is_awake(): device_eeg_event.set_awake()
+
+# Визуализация
+fig, (ax_eeg, ax_psd) = plt.subplots(2, 1, figsize=(10, 8))
+lines_eeg = [ax_eeg.plot([], [], lw=1)[0] for _ in range(CHANNELS)]
+ax_eeg.set_title("EEG")
+ax_eeg.grid(True)
+
+lines_psd = [ax_psd.plot([], [], lw=1)[0] for _ in range(CHANNELS)]
+thr_line = ax_psd.axhline(THRESHOLD, color='red', linestyle='--', label='Threshold')
+ax_psd.set_title("PSD & Control Threshold")
+ax_psd.set_xlim(0, 45)
+ax_psd.set_ylim(0, 1e-11)
+ax_psd.grid(True)
+ax_psd.legend()
+
+txt_status = fig.text(0.5, 0.02, "Status: Calibrating...", ha='center', fontweight='bold')
+txt_imp = fig.text(0.02, 0.02, "Imp: ...", fontsize=8, family='monospace')
+
+start_time = time.time()
+
+def update_plot(_):
+    global channel_names
+    buf = ring.get()
+    if buf.shape[1] == 0: return lines_eeg + lines_psd
+
+    t = np.linspace(-EEG_WINDOW_SECONDS, 0, buf.shape[1])
+    for i in range(CHANNELS):
+        lines_eeg[i].set_data(t, buf[i, :])
+    
+    all_eeg = buf.flatten()
+    ax_eeg.set_ylim(all_eeg.min()*1.1, all_eeg.max()*1.1)
+    ax_eeg.set_xlim(-EEG_WINDOW_SECONDS, 0)
+
+    try:
+        freqs, psd = compute_psd_mne(buf, sfreq=SAMPLE_RATE, fmin=1.0, fmax=50.0)
+        for i in range(min(psd.shape[0], CHANNELS)):
+            lines_psd[i].set_data(freqs, psd[i, :])
+        
+        # Логика управления
+        low, high = (BETA_LOW, BETA_HIGH) if USE_BETA else (ALPHA_LOW, ALPHA_HIGH)
+        pows = integrate_band(freqs, psd, low, high)
+        avg_pow = np.mean(pows)
+
+        if (time.time() - start_time) > CALIBRATION_DURATION:
+            if avg_pow > THRESHOLD:
+                txt_status.set_text(f"FORWARD ({'BETA' if USE_BETA else 'ALPHA'} > Thr)")
+                txt_status.set_color('green')
+                send_cmd("F,50")
+            else:
+                txt_status.set_text("STOP / BACKWARD")
+                txt_status.set_color('red')
+                send_cmd("S")
+        else:
+            txt_status.set_text(f"Calibrating... {int(CALIBRATION_DURATION - (time.time() - start_time))}s")
+
+    except: pass
+
+    imp_str = "Imp (kOhm): " + " | ".join([f"{channel_names[i] if i<len(channel_names) else i}: {resistances_values[i]:.1f}" for i in range(CHANNELS)])
+    txt_imp.set_text(imp_str)
+
+    return lines_eeg + lines_psd
+
+def main():
+    global device_locator, device
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    lib_path = os.path.join(script_dir, 'CapsuleClient.dll' if PLATFORM == 'win' else 'libCapsuleClient.dylib')
+    
+    capsuleLib = Capsule(lib_path)
+    device_locator = DeviceLocator(capsuleLib.get_lib())
+    device_locator.set_on_devices_list(on_device_list)
+    device_locator.request_devices(device_type=DeviceType.Band, seconds_to_search=10)
+
+    if not non_blocking_cond_wait(device_list_event, 'device list', 12): return
+
+    device.set_on_connection_status_changed(on_connection_status_changed)
+    device.set_on_eeg(on_eeg)
+    device.set_on_resistances(lambda d, r: on_resistances(r))
+    device.connect(bipolarChannels=False)
+
+    if not non_blocking_cond_wait(device_conn_event, 'device connection', 20): return
+
+    device.start()
+    ani = FuncAnimation(fig, update_plot, interval=100, blit=False, cache_frame_data=False)
+
+    running = True
+    def updater():
+        while running:
+            try: device_locator.update()
+            except: pass
+            time.sleep(0.01)
+
+    threading.Thread(target=updater, daemon=True).start()
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    plt.show()
+
+    running = False
+    device.stop()
+    device.disconnect()
+
+if __name__ == '__main__':
+    main()
 
 def send_to_esp32(cmd):
     """Отправляет команду на ESP32."""
